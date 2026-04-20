@@ -20,9 +20,69 @@ def _run_cmd(cmd: list[str]) -> int:
     return int(p.returncode)
 
 
+def _resolve_python_interpreter(python_arg: str | None) -> str:
+    """
+    Resolve Python executable for child runs.
+
+    Default to current interpreter for consistency with active environment.
+    """
+    if python_arg and python_arg.strip():
+        exe = python_arg.strip()
+        if not Path(exe).is_absolute() and "/" in exe:
+            exe = str((Path.cwd() / exe).resolve())
+        elif "/" not in exe:
+            # Let PATH resolution handle simple names like "python3".
+            pass
+    else:
+        exe = sys.executable
+    return exe
+
+
+def _assert_python_version(py_exe: str, min_major: int = 3, min_minor: int = 10) -> None:
+    cmd = [
+        py_exe,
+        "-c",
+        (
+            "import sys; "
+            "print(f'{sys.version_info.major}.{sys.version_info.minor}'); "
+            "print(sys.executable)"
+        ),
+    ]
+    out = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    if out.returncode != 0:
+        raise SystemExit(
+            f"Unable to run interpreter {py_exe!r}. "
+            f"stderr: {out.stderr.strip() or '<empty>'}"
+        )
+    lines = [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+    ver = lines[0] if lines else "0.0"
+    try:
+        major, minor = (int(x) for x in ver.split(".")[:2])
+    except Exception:
+        raise SystemExit(f"Could not parse Python version from {py_exe!r}: {ver!r}")
+
+    if (major, minor) < (min_major, min_minor):
+        resolved = lines[1] if len(lines) > 1 else py_exe
+        raise SystemExit(
+            "Python interpreter is too old for this project.\n"
+            f"  requested: {py_exe}\n"
+            f"  resolved:  {resolved}\n"
+            f"  version:   {major}.{minor}\n"
+            f"  required:  >= {min_major}.{min_minor}\n"
+            "Tip: activate your project venv and omit --python, or pass a newer interpreter."
+        )
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--python", default=str(Path(".venv/bin/python")))
+    p.add_argument(
+        "--python",
+        default="",
+        help=(
+            "Python executable for child scripts. Default: current interpreter "
+            "(sys.executable)."
+        ),
+    )
     p.add_argument("--total-glob", default="data/darshan_total/App*.parquet")
     p.add_argument("--detail-root", default="data/2021")
     p.add_argument("--with-detail", action="store_true")
@@ -37,7 +97,9 @@ def main() -> None:
     p.add_argument("--max-runs", type=int, default=0, help="Optional cap on number of runs.")
     args = p.parse_args()
 
-    py = args.python
+    py = _resolve_python_interpreter(args.python)
+    _assert_python_version(py, 3, 10)
+
     out_root = Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)
 
