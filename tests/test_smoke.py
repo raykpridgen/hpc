@@ -14,6 +14,7 @@ from darshan_surrogate.leakage import (
 from darshan_surrogate.detail_join import join_detail_features
 from darshan_surrogate.features import apply_group_filters
 from darshan_surrogate.training import train_surrogate
+from run_eda_sweep import _expand_total_glob, _resolve_detail_root
 
 
 def test_assert_no_forbidden_columns_ok() -> None:
@@ -152,3 +153,21 @@ def test_apply_group_filters_include_and_exclude() -> None:
     X2, dropped = apply_group_filters(X, include_groups=["posix", "calendar", "app"])
     assert list(X2.columns) == ["total_POSIX_READS", "month_1", "app_id_code"]
     assert "total_MPIIO_HINTS" in dropped
+
+
+def test_run_sweep_path_helpers_support_parent_layout(tmp_path, monkeypatch) -> None:
+    # Simulate repo/hpc (cwd) and sibling repo/darshan_share.
+    repo = tmp_path / "repo"
+    hpc = repo / "hpc"
+    totals = repo / "darshan_share" / "darshan_total"
+    details = repo / "darshan_share" / "darshan_detail"
+    hpc.mkdir(parents=True, exist_ok=True)
+    totals.mkdir(parents=True, exist_ok=True)
+    details.mkdir(parents=True, exist_ok=True)
+    (totals / "App1.parquet").write_text("x", encoding="utf-8")
+
+    monkeypatch.chdir(hpc)
+    m = _expand_total_glob("../darshan_share/darshan_total/App*.parquet")
+    assert len(m) == 1
+    d = _resolve_detail_root("../darshan_share/darshan_detail")
+    assert d is not None and d.resolve() == details.resolve()

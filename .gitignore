@@ -3,6 +3,7 @@ out/**/*.csv
 out/**/*.ubj
 !out/**/.gitkeep
 data/
+darshan_share/
 out/
 specs/
 __pycache__/

@@ -125,11 +125,23 @@ def main() -> None:
         seen.add(rp)
         deduped.append(rp)
     total_paths = deduped
+    if not total_paths:
+        raise FileNotFoundError(
+            "No total parquet files resolved from --total-glob input. "
+            f"Received patterns/paths: {args.total_glob}"
+        )
     for tp in total_paths:
         if not tp.exists():
             raise FileNotFoundError(f"Total parquet not found: {tp}")
 
     df = load_totals_with_app_id([str(p) for p in total_paths])
+    required_target_cols = {"total_POSIX_BYTES_READ", "total_POSIX_BYTES_WRITTEN", "runtime"}
+    missing_req = sorted(required_target_cols - set(df.columns))
+    if missing_req:
+        raise KeyError(
+            "Totals schema is missing required target columns: "
+            f"{missing_req}. Available columns sample: {list(df.columns[:20])}"
+        )
     join_stats: dict = {"detail_used": False}
 
     if not args.no_detail:

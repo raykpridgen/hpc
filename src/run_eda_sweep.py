@@ -9,6 +9,7 @@ automatically triggers post-sweep summarization.
 from __future__ import annotations
 
 import argparse
+import glob
 import subprocess
 import sys
 from pathlib import Path
@@ -73,6 +74,45 @@ def _assert_python_version(py_exe: str, min_major: int = 3, min_minor: int = 10)
         )
 
 
+def _expand_total_glob(pattern: str) -> list[str]:
+    p = Path(pattern)
+    candidates: list[str] = []
+    if p.is_absolute():
+        candidates = [str(p)]
+    else:
+        # Support both:
+        # - running from repo/hpc with data under ../darshan_share
+        # - running from repo root with local relative paths
+        candidates = [
+            str((Path.cwd() / p).resolve()),
+            str((Path.cwd().parent / p).resolve()),
+        ]
+    seen: set[str] = set()
+    matches: list[str] = []
+    for pat in candidates:
+        for m in sorted(glob.glob(pat)):
+            if m not in seen:
+                seen.add(m)
+                matches.append(m)
+    return matches
+
+
+def _resolve_detail_root(path_str: str) -> Path | None:
+    p = Path(path_str)
+    cands: list[Path]
+    if p.is_absolute():
+        cands = [p]
+    else:
+        cands = [
+            (Path.cwd() / p).resolve(),
+            (Path.cwd().parent / p).resolve(),
+        ]
+    for c in cands:
+        if c.exists() and c.is_dir():
+            return c
+    return None
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -83,8 +123,8 @@ def main() -> None:
             "(sys.executable)."
         ),
     )
-    p.add_argument("--total-glob", default="data/darshan_total/App*.parquet")
-    p.add_argument("--detail-root", default="data/2021")
+    p.add_argument("--total-glob", default="../darshan_share/darshan_total/App*.parquet")
+    p.add_argument("--detail-root", default="../darshan_share/darshan_detail")
     p.add_argument("--with-detail", action="store_true")
     p.add_argument(
         "--profile",
@@ -100,13 +140,27 @@ def main() -> None:
     py = _resolve_python_interpreter(args.python)
     _assert_python_version(py, 3, 10)
 
+    total_matches = _expand_total_glob(args.total_glob)
+    if not total_matches:
+        raise SystemExit(
+            f"No files matched --total-glob {args.total_glob!r} "
+            f"(resolved cwd={Path.cwd()})"
+        )
+
     out_root = Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)
 
-    base = [py, "src/train_parquet_surrogate.py", "--total-glob", args.total_glob]
+    base = [py, "src/train_parquet_surrogate.py", "--total-glob", *total_matches]
     with_detail = args.with_detail or (args.profile == "detail_interactions")
     if with_detail:
-        base += ["--detail-root", args.detail_root]
+        droot = _resolve_detail_root(args.detail_root)
+        if droot is None:
+            raise SystemExit(
+                f"--detail-root does not exist: {args.detail_root!r} "
+                f"(searched: {(Path.cwd() / args.detail_root).resolve()}, "
+                f"{(Path.cwd().parent / args.detail_root).resolve()})"
+            )
+        base += ["--detail-root", str(droot)]
     else:
         base += ["--no-detail"]
     if args.optuna_trials > 0:
