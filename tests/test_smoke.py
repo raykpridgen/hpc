@@ -14,7 +14,7 @@ from darshan_surrogate.leakage import (
 from darshan_surrogate.detail_join import join_detail_features
 from darshan_surrogate.features import apply_group_filters
 from darshan_surrogate.training import train_surrogate
-from run_eda_sweep import _expand_total_glob, _resolve_detail_root
+from run_eda_sweep import _expand_total_glob, _load_checkpoint, _resolve_detail_root, _save_checkpoint
 
 
 def test_assert_no_forbidden_columns_ok() -> None:
@@ -171,3 +171,13 @@ def test_run_sweep_path_helpers_support_parent_layout(tmp_path, monkeypatch) -> 
     assert len(m) == 1
     d = _resolve_detail_root("../darshan_share/darshan_detail")
     assert d is not None and d.resolve() == details.resolve()
+
+
+def test_checkpoint_roundtrip(tmp_path) -> None:
+    out_root = tmp_path / "sweep_out"
+    out_root.mkdir(parents=True, exist_ok=True)
+    ckpt = _load_checkpoint(out_root)
+    ckpt["runs"]["demo"] = {"status": "ok", "return_code": 0}
+    _save_checkpoint(out_root, ckpt)
+    ckpt2 = _load_checkpoint(out_root)
+    assert ckpt2["runs"]["demo"]["status"] == "ok"

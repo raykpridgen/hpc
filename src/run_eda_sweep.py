@@ -10,15 +10,64 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import subprocess
 import sys
 from pathlib import Path
+from datetime import datetime, timezone
 
 
 def _run_cmd(cmd: list[str]) -> int:
     print("[run]", " ".join(cmd))
     p = subprocess.run(cmd, check=False)
     return int(p.returncode)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _checkpoint_path(out_root: Path) -> Path:
+    return out_root / "checkpoint.json"
+
+
+def _load_checkpoint(out_root: Path) -> dict:
+    p = _checkpoint_path(out_root)
+    if not p.exists():
+        return {
+            "created_at": _utc_now(),
+            "updated_at": _utc_now(),
+            "runs": {},
+            "summary": {},
+        }
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("checkpoint root must be object")
+        data.setdefault("runs", {})
+        data.setdefault("summary", {})
+        data["updated_at"] = _utc_now()
+        return data
+    except Exception:
+        # If corrupted, keep old copy and start fresh.
+        bak = p.with_suffix(".json.bak")
+        p.replace(bak)
+        return {
+            "created_at": _utc_now(),
+            "updated_at": _utc_now(),
+            "runs": {},
+            "summary": {"warning": f"checkpoint was corrupted; backup at {bak.name}"},
+        }
+
+
+def _save_checkpoint(out_root: Path, ckpt: dict) -> None:
+    p = _checkpoint_path(out_root)
+    ckpt["updated_at"] = _utc_now()
+    tmp = p.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(ckpt, f, indent=2)
+    tmp.replace(p)
 
 
 def _resolve_python_interpreter(python_arg: str | None) -> str:
@@ -135,6 +184,22 @@ def main() -> None:
     p.add_argument("--out-root", default="out/sweeps")
     p.add_argument("--optuna-trials", type=int, default=0)
     p.add_argument("--max-runs", type=int, default=0, help="Optional cap on number of runs.")
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        default=True,
+        help="Resume from checkpoint.json under out-root (default: on).",
+    )
+    p.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Ignore checkpoint and rerun all matrix entries.",
+    )
+    p.add_argument(
+        "--rerun-failed",
+        action="store_true",
+        help="When resuming, rerun failed entries (default skips only successful ones).",
+    )
     args = p.parse_args()
 
     py = _resolve_python_interpreter(args.python)
@@ -149,6 +214,15 @@ def main() -> None:
 
     out_root = Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)
+    use_resume = args.resume and not args.no_resume
+    ckpt = _load_checkpoint(out_root) if use_resume else {
+        "created_at": _utc_now(),
+        "updated_at": _utc_now(),
+        "runs": {},
+        "summary": {},
+    }
+    if use_resume:
+        _save_checkpoint(out_root, ckpt)
 
     base = [py, "src/train_parquet_surrogate.py", "--total-glob", *total_matches]
     with_detail = args.with_detail or (args.profile == "detail_interactions")
@@ -200,11 +274,44 @@ def main() -> None:
 
     failures: list[str] = []
     for run_id, extra in matrix:
+        prior = ckpt.get("runs", {}).get(run_id, {})
+        if use_resume and prior.get("status") == "ok":
+            print(f"[skip] {run_id}: already completed in checkpoint")
+            continue
+        if use_resume and (not args.rerun_failed) and prior.get("status") == "failed":
+            print(f"[skip] {run_id}: previous failure (use --rerun-failed to retry)")
+            failures.append(run_id)
+            continue
+
         run_out = str(out_root / run_id)
         cmd = base + ["--out", run_out] + extra
+        ckpt["runs"][run_id] = {
+            "status": "running",
+            "started_at": _utc_now(),
+            "cmd": cmd,
+            "run_out": run_out,
+        }
+        _save_checkpoint(out_root, ckpt)
         rc = _run_cmd(cmd)
         if rc != 0:
             failures.append(run_id)
+            ckpt["runs"][run_id] = {
+                "status": "failed",
+                "finished_at": _utc_now(),
+                "return_code": rc,
+                "cmd": cmd,
+                "run_out": run_out,
+            }
+            _save_checkpoint(out_root, ckpt)
+        else:
+            ckpt["runs"][run_id] = {
+                "status": "ok",
+                "finished_at": _utc_now(),
+                "return_code": rc,
+                "cmd": cmd,
+                "run_out": run_out,
+            }
+            _save_checkpoint(out_root, ckpt)
 
     # Always run summarizer so partial sweeps still produce a report.
     sum_cmd = [
@@ -215,7 +322,9 @@ def main() -> None:
         "--baseline-run",
         baseline_run,
     ]
-    _run_cmd(sum_cmd)
+    sum_rc = _run_cmd(sum_cmd)
+    ckpt["summary"]["summarize_rc"] = sum_rc
+    _save_checkpoint(out_root, ckpt)
 
     # Memory estimate helper after sweep.
     est_cmd = [
@@ -226,7 +335,9 @@ def main() -> None:
     ]
     if with_detail:
         est_cmd += ["--with-detail"]
-    _run_cmd(est_cmd)
+    est_rc = _run_cmd(est_cmd)
+    ckpt["summary"]["estimate_rc"] = est_rc
+    _save_checkpoint(out_root, ckpt)
 
     if failures:
         print("[warn] failed runs:", ", ".join(failures))
