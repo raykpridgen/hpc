@@ -3,6 +3,7 @@ out/**/*.csv
 out/**/*.ubj
 !out/**/.gitkeep
 data/
+out/
 specs/
 __pycache__/
 *.py[cod]

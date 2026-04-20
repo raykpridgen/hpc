@@ -108,3 +108,39 @@ def apply_correlation_leakage_filter(
     if not to_drop:
         return X, records
     return X.drop(columns=to_drop, errors="ignore"), records
+
+
+def apply_name_substring_prefilter(
+    X: pd.DataFrame,
+    substrings: list[str],
+) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Drop feature columns whose names contain any provided substring (case-insensitive).
+
+    Intended for coarse EDA passes (e.g., dropping '*BYTES*'/'*TIME*' families)
+    before model fitting.
+    """
+    keys = [s.upper() for s in substrings if s and s.strip()]
+    if not keys:
+        return X, []
+
+    to_drop: list[str] = []
+    for c in X.columns:
+        cu = c.upper()
+        if any(k in cu for k in keys):
+            to_drop.append(c)
+
+    if not to_drop:
+        return X, []
+    return X.drop(columns=to_drop, errors="ignore"), to_drop
+
+
+def apply_timestamp_prefilter(X: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Always drop timestamp-like feature columns.
+
+    This is a conservative guardrail against direct/near-direct temporal leakage
+    from module timestamp counters (e.g. *_TIMESTAMP family), while keeping other
+    non-target counters (including non-POSIX BYTES/TIME aggregates).
+    """
+    return apply_name_substring_prefilter(X, ["TIMESTAMP"])

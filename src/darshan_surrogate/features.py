@@ -13,6 +13,22 @@ LEAKAGE_COLS = LEAKAGE_TOTAL_COUNTERS
 
 META_EXCLUDE = frozenset({"uid", "exe", "jobid"})
 
+GROUP_NAMES = frozenset(
+    {
+        "posix",
+        "mpiio",
+        "h5",
+        "stdio",
+        "lustre",
+        "bgq",
+        "pnetcdf",
+        "detail",
+        "calendar",
+        "app",
+        "other",
+    }
+)
+
 
 def add_calendar_one_hot(df: pd.DataFrame, time_col: str = "start_time") -> pd.DataFrame:
     """One-hot encode calendar month (1–12) as month_1 … month_12."""
@@ -42,6 +58,64 @@ def drop_constant_columns(train: pd.DataFrame, cols: list[str], eps: float = 1e-
         if pd.isna(v) or v > eps:
             keep.append(c)
     return keep
+
+
+def infer_feature_group(col: str) -> str:
+    """Map a feature column to a coarse family for sweep ablations."""
+    if col.startswith("month_"):
+        return "calendar"
+    if col == "app_id_code":
+        return "app"
+    if col == "missing_detail" or col.startswith("detail_"):
+        return "detail"
+    if col.startswith("total_POSIX_"):
+        return "posix"
+    if col.startswith("total_MPIIO_"):
+        return "mpiio"
+    if col.startswith("total_H5D_") or col.startswith("total_H5F_"):
+        return "h5"
+    if col.startswith("total_STDIO_"):
+        return "stdio"
+    if col.startswith("total_LUSTRE_"):
+        return "lustre"
+    if col.startswith("total_BGQ_"):
+        return "bgq"
+    if col.startswith("total_PNETCDF_"):
+        return "pnetcdf"
+    return "other"
+
+
+def apply_group_filters(
+    X: pd.DataFrame,
+    *,
+    include_groups: list[str] | None = None,
+    exclude_groups: list[str] | None = None,
+) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Keep/drop feature groups by coarse module family.
+
+    Returns filtered dataframe and list of dropped columns.
+    """
+    include = {g.strip().lower() for g in (include_groups or []) if g and g.strip()}
+    exclude = {g.strip().lower() for g in (exclude_groups or []) if g and g.strip()}
+
+    bad = (include | exclude) - GROUP_NAMES
+    if bad:
+        raise ValueError(f"Unknown feature groups: {sorted(bad)}. Allowed: {sorted(GROUP_NAMES)}")
+
+    keep_cols: list[str] = []
+    dropped: list[str] = []
+    for c in X.columns:
+        g = infer_feature_group(c)
+        if include and g not in include:
+            dropped.append(c)
+            continue
+        if g in exclude:
+            dropped.append(c)
+            continue
+        keep_cols.append(c)
+
+    return X[keep_cols].copy(), dropped
 
 
 def build_feature_matrix(

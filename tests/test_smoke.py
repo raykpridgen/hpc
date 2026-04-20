@@ -9,7 +9,11 @@ import pytest
 from darshan_surrogate.leakage import (
     assert_no_forbidden_columns,
     apply_correlation_leakage_filter,
+    apply_timestamp_prefilter,
 )
+from darshan_surrogate.detail_join import join_detail_features
+from darshan_surrogate.features import apply_group_filters
+from darshan_surrogate.training import train_surrogate
 
 
 def test_assert_no_forbidden_columns_ok() -> None:
@@ -58,3 +62,93 @@ def test_correlation_filter_keeps_month_columns() -> None:
 
 def test_import_train_entrypoint() -> None:
     import train_parquet_surrogate  # noqa: F401 — smoke import path
+
+
+def test_timestamp_prefilter_drops_timestamp_columns_only() -> None:
+    X = pd.DataFrame(
+        {
+            "total_POSIX_F_OPEN_START_TIMESTAMP": [1.0, 2.0, 3.0],
+            "total_POSIX_F_READ_TIME": [0.1, 0.2, 0.3],
+            "total_POSIX_READS": [5, 6, 7],
+        }
+    )
+    X2, dropped = apply_timestamp_prefilter(X)
+    assert "total_POSIX_F_OPEN_START_TIMESTAMP" not in X2.columns
+    assert "total_POSIX_F_READ_TIME" in X2.columns
+    assert "total_POSIX_READS" in X2.columns
+    assert dropped == ["total_POSIX_F_OPEN_START_TIMESTAMP"]
+
+
+def test_train_surrogate_optuna_path_runs() -> None:
+    rng = np.random.default_rng(7)
+    n = 80
+    X = pd.DataFrame(
+        {
+            "total_POSIX_READS": rng.normal(size=n),
+            "total_MPIIO_HINTS": rng.normal(size=n),
+            "month_1": rng.integers(0, 2, size=n),
+            "app_id_code": rng.integers(0, 3, size=n),
+        }
+    )
+    z = rng.normal(size=n)
+    train_idx = np.arange(60)
+    val_idx = np.arange(60, n)
+
+    model, metrics = train_surrogate(
+        X.iloc[train_idx],
+        z[train_idx],
+        X.iloc[val_idx],
+        z[val_idx],
+        n_optuna_trials=1,
+        early_stopping_rounds=5,
+    )
+    assert model is not None
+    assert "optuna_best_rmse" in metrics
+    assert metrics["n_trials"] == 1
+
+
+def test_join_detail_features_aggregates_across_shards(tmp_path) -> None:
+    # Build detail hierarchy: YYYY/M/D/jobid-{0,1}.parquet
+    detail_root = tmp_path / "detail"
+    day_dir = detail_root / "2021" / "1" / "1"
+    day_dir.mkdir(parents=True, exist_ok=True)
+
+    pd.DataFrame(
+        {
+            "filename": ["f1", "f2"],
+            "POSIX_BYTES_READ": [10.0, 20.0],
+            "POSIX_BYTES_WRITTEN": [0.0, 5.0],
+            "POSIX_F_VARIANCE_RANK_BYTES": [1.0, 3.0],
+        }
+    ).to_parquet(day_dir / "123-0.parquet", index=False)
+    pd.DataFrame(
+        {
+            "filename": ["f2", "f3"],
+            "POSIX_BYTES_READ": [30.0, 0.0],
+            "POSIX_BYTES_WRITTEN": [5.0, 10.0],
+            "POSIX_F_VARIANCE_RANK_BYTES": [5.0, 7.0],
+        }
+    ).to_parquet(day_dir / "123-1.parquet", index=False)
+
+    # start_time for 2021-01-01 UTC.
+    total_df = pd.DataFrame({"jobid": [123], "start_time": [1609459200]})
+    out, stats = join_detail_features(total_df, detail_root, missing_threshold=0.2)
+
+    assert stats["n_missing_detail"] == 0
+    assert float(out["detail_n_files"].iloc[0]) == 3.0
+    assert int(out["missing_detail"].iloc[0]) == 0
+    assert float(out["detail_posix_var_mean"].iloc[0]) == 4.0
+
+
+def test_apply_group_filters_include_and_exclude() -> None:
+    X = pd.DataFrame(
+        {
+            "total_POSIX_READS": [1, 2],
+            "total_MPIIO_HINTS": [0, 1],
+            "month_1": [1, 0],
+            "app_id_code": [0, 1],
+        }
+    )
+    X2, dropped = apply_group_filters(X, include_groups=["posix", "calendar", "app"])
+    assert list(X2.columns) == ["total_POSIX_READS", "month_1", "app_id_code"]
+    assert "total_MPIIO_HINTS" in dropped

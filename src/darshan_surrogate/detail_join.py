@@ -6,6 +6,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+try:
+    import pyarrow.parquet as pq
+except ImportError:  # pragma: no cover
+    pq = None
 
 
 def _detail_day_dir(detail_root: Path, start_time: int) -> Path:
@@ -27,17 +31,52 @@ def _aggregate_detail_frames(paths: list[Path]) -> dict[str, float]:
             "detail_posix_cv": np.nan,
             "detail_posix_var_mean": np.nan,
         }
-    dfs = [pd.read_parquet(p) for p in paths]
-    d = pd.concat(dfs, ignore_index=True)
-    n_files = float(d["filename"].nunique()) if "filename" in d.columns else np.nan
-    br = d["POSIX_BYTES_READ"].fillna(0.0) if "POSIX_BYTES_READ" in d.columns else pd.Series(0.0, index=d.index)
-    bw = d["POSIX_BYTES_WRITTEN"].fillna(0.0) if "POSIX_BYTES_WRITTEN" in d.columns else pd.Series(0.0, index=d.index)
-    rec = br.astype(float) + bw.astype(float)
-    mean = float(rec.mean()) if len(rec) else 0.0
-    std = float(rec.std(ddof=0)) if len(rec) else 0.0
+    # Stream batches per shard to keep peak memory bounded.
+    file_set: set[str] = set()
+    n_rec = 0
+    rec_sum = 0.0
+    rec_sq_sum = 0.0
+    var_sum = 0.0
+    var_n = 0
+
+    need_cols = ["filename", "POSIX_BYTES_READ", "POSIX_BYTES_WRITTEN", "POSIX_F_VARIANCE_RANK_BYTES"]
+
+    for p in paths:
+        if pq is None:
+            d = pd.read_parquet(p)
+            batches = [d]
+        else:
+            pf = pq.ParquetFile(p)
+            avail = set(pf.schema.names)
+            cols = [c for c in need_cols if c in avail]
+            batches = (b.to_pandas() for b in pf.iter_batches(columns=cols, batch_size=65536))
+
+        for b in batches:
+            if "filename" in b.columns:
+                fn = b["filename"].dropna()
+                if len(fn):
+                    file_set.update(fn.astype(str).tolist())
+
+            br = pd.to_numeric(b.get("POSIX_BYTES_READ", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+            bw = pd.to_numeric(b.get("POSIX_BYTES_WRITTEN", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+            rec = br + bw
+            if rec.size:
+                n_rec += int(rec.size)
+                rec_sum += float(rec.sum())
+                rec_sq_sum += float(np.square(rec).sum())
+
+            if "POSIX_F_VARIANCE_RANK_BYTES" in b.columns:
+                vv = pd.to_numeric(b["POSIX_F_VARIANCE_RANK_BYTES"], errors="coerce").dropna().to_numpy(dtype=float)
+                if vv.size:
+                    var_sum += float(vv.sum())
+                    var_n += int(vv.size)
+
+    n_files = float(len(file_set)) if file_set else np.nan
+    mean = (rec_sum / n_rec) if n_rec else 0.0
+    var = max((rec_sq_sum / n_rec) - (mean * mean), 0.0) if n_rec else 0.0
+    std = float(np.sqrt(var))
     cv = std / mean if mean > 1e-12 else 0.0
-    var_col = "POSIX_F_VARIANCE_RANK_BYTES"
-    var_mean = float(d[var_col].mean()) if var_col in d.columns else np.nan
+    var_mean = (var_sum / var_n) if var_n else np.nan
     return {
         "detail_n_files": n_files,
         "detail_posix_cv": float(cv),

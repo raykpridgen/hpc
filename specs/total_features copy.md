@@ -35,3 +35,6 @@ total_STDIO_F_FASTEST_RANK_TIME
 total_STDIO_F_SLOWEST_RANK_TIME
 total_STDIO_F_VARIANCE_RANK_TIME
 total_STDIO_F_VARIANCE_RANK_BYTES
+
+
+srun --partition=debug --pty --account=<<project>> --nodes=1 --ntasks-per-node=4 --mem=8G -t 00:30:00 --wait=0 --export=ALL /bin/bash

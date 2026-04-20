@@ -11,6 +11,7 @@ Run from repo root with conda env:
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import sys
 from pathlib import Path
@@ -24,8 +25,13 @@ if str(_SRC) not in sys.path:
 
 from darshan_surrogate.artifacts import save_join_stats, save_metrics, save_y_eda
 from darshan_surrogate.detail_join import join_detail_features
-from darshan_surrogate.features import build_feature_matrix
-from darshan_surrogate.leakage import assert_no_forbidden_columns, apply_correlation_leakage_filter
+from darshan_surrogate.features import apply_group_filters, build_feature_matrix
+from darshan_surrogate.leakage import (
+    apply_correlation_leakage_filter,
+    apply_name_substring_prefilter,
+    apply_timestamp_prefilter,
+    assert_no_forbidden_columns,
+)
 from darshan_surrogate.io import load_totals_with_app_id
 from darshan_surrogate.paths import ensure_out_dirs, project_root
 from darshan_surrogate.split import time_ordered_split
@@ -58,6 +64,33 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable correlation-based proxy-leakage filter (not recommended).",
     )
+    p.add_argument(
+        "--drop-name-substrings",
+        nargs="+",
+        default=[],
+        help=(
+            "Optional coarse prefilter: drop feature columns containing any of these "
+            "substrings (case-insensitive), e.g. BYTES TIME."
+        ),
+    )
+    p.add_argument(
+        "--include-groups",
+        nargs="+",
+        default=[],
+        help=(
+            "Optional coarse feature groups to keep. Allowed: "
+            "posix mpiio h5 stdio lustre bgq pnetcdf detail calendar app other."
+        ),
+    )
+    p.add_argument(
+        "--exclude-groups",
+        nargs="+",
+        default=[],
+        help=(
+            "Optional coarse feature groups to drop. Allowed: "
+            "posix mpiio h5 stdio lustre bgq pnetcdf detail calendar app other."
+        ),
+    )
     return p.parse_args()
 
 
@@ -71,7 +104,27 @@ def main() -> None:
     else:
         out = ensure_out_dirs(repo, out_name)
 
-    total_paths = [(repo / p).resolve() if not Path(p).is_absolute() else Path(p) for p in args.total_glob]
+    total_paths: list[Path] = []
+    for p in args.total_glob:
+        token = str(p)
+        # Allow shell-style wildcards passed as literal args (e.g. App*.parquet).
+        if any(ch in token for ch in "*?[]"):
+            pattern = (repo / token).as_posix() if not Path(token).is_absolute() else token
+            for m in sorted(glob.glob(pattern)):
+                total_paths.append(Path(m))
+        else:
+            total_paths.append((repo / token).resolve() if not Path(token).is_absolute() else Path(token))
+
+    # stable de-dup preserving order
+    seen: set[Path] = set()
+    deduped: list[Path] = []
+    for tp in total_paths:
+        rp = tp.resolve()
+        if rp in seen:
+            continue
+        seen.add(rp)
+        deduped.append(rp)
+    total_paths = deduped
     for tp in total_paths:
         if not tp.exists():
             raise FileNotFoundError(f"Total parquet not found: {tp}")
@@ -111,6 +164,49 @@ def main() -> None:
         train_pos,
         drop_sparse_frac=None,
     )
+    X_all, timestamp_prefilter_drops = apply_timestamp_prefilter(X_all)
+    if timestamp_prefilter_drops:
+        pd.DataFrame({"column": timestamp_prefilter_drops}).to_csv(
+            out["eda"] / "timestamp_prefilter_drops.csv",
+            index=False,
+        )
+        print(f"Timestamp prefilter: dropped {len(timestamp_prefilter_drops)} features.")
+
+    name_prefilter_drops: list[str] = []
+    if args.drop_name_substrings:
+        X_all, name_prefilter_drops = apply_name_substring_prefilter(
+            X_all,
+            args.drop_name_substrings,
+        )
+        if name_prefilter_drops:
+            pd.DataFrame({"column": name_prefilter_drops}).to_csv(
+                out["eda"] / "name_prefilter_drops.csv",
+                index=False,
+            )
+            print(
+                f"Name prefilter: dropped {len(name_prefilter_drops)} features "
+                f"for substrings={args.drop_name_substrings}."
+            )
+    group_filter_drops: list[str] = []
+    if args.include_groups or args.exclude_groups:
+        X_all, group_filter_drops = apply_group_filters(
+            X_all,
+            include_groups=args.include_groups,
+            exclude_groups=args.exclude_groups,
+        )
+        if group_filter_drops:
+            pd.DataFrame({"column": group_filter_drops}).to_csv(
+                out["eda"] / "group_filter_drops.csv",
+                index=False,
+            )
+        print(
+            "Group filter:",
+            {
+                "include": args.include_groups,
+                "exclude": args.exclude_groups,
+                "n_dropped": len(group_filter_drops),
+            },
+        )
     assert_no_forbidden_columns(X_all.columns)
 
     corr_records: list[dict] = []
@@ -160,6 +256,9 @@ def main() -> None:
         "max_abs_corr_with_y": args.max_abs_corr_with_y,
         "corr_filter_disabled": bool(args.no_corr_filter),
         "n_corr_leakage_drops": len(corr_records),
+        "n_name_prefilter_drops": len(name_prefilter_drops),
+        "n_timestamp_prefilter_drops": len(timestamp_prefilter_drops),
+        "n_group_filter_drops": len(group_filter_drops),
     }
     save_metrics(out["train"] / "metrics.csv", row)
     print("Validation (original y):", metrics_y)
@@ -177,6 +276,12 @@ def main() -> None:
         "detail_used": join_stats.get("detail_used", False),
         "max_abs_corr_with_y": args.max_abs_corr_with_y,
         "corr_filter_disabled": args.no_corr_filter,
+        "drop_name_substrings": args.drop_name_substrings,
+        "include_groups": args.include_groups,
+        "exclude_groups": args.exclude_groups,
+        "timestamp_prefilter_drops": timestamp_prefilter_drops,
+        "name_prefilter_drops": name_prefilter_drops,
+        "group_filter_drops": group_filter_drops,
         "correlation_leakage_drops": [r["column"] for r in corr_records],
     }
     with open(out["models"] / "metadata.json", "w", encoding="utf-8") as f:

@@ -129,7 +129,6 @@ def _train_with_optuna(
         "optuna_best_rmse": study.best_value,
         "n_trials": n_trials,
     }
-    best_state["study"] = study
     return model, metrics_z
 
 
