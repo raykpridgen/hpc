@@ -23,6 +23,11 @@ def _run_cmd(cmd: list[str]) -> int:
     return int(p.returncode)
 
 
+def _project_root() -> Path:
+    """Project root containing `src/` (e.g. repo/hpc)."""
+    return Path(__file__).resolve().parents[1]
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -129,12 +134,15 @@ def _expand_total_glob(pattern: str) -> list[str]:
     if p.is_absolute():
         candidates = [str(p)]
     else:
+        proj = _project_root()
         # Support both:
         # - running from repo/hpc with data under ../darshan_share
         # - running from repo root with local relative paths
         candidates = [
             str((Path.cwd() / p).resolve()),
             str((Path.cwd().parent / p).resolve()),
+            str((proj / p).resolve()),
+            str((proj.parent / p).resolve()),
         ]
     seen: set[str] = set()
     matches: list[str] = []
@@ -152,9 +160,12 @@ def _resolve_detail_root(path_str: str) -> Path | None:
     if p.is_absolute():
         cands = [p]
     else:
+        proj = _project_root()
         cands = [
             (Path.cwd() / p).resolve(),
             (Path.cwd().parent / p).resolve(),
+            (proj / p).resolve(),
+            (proj.parent / p).resolve(),
         ]
     for c in cands:
         if c.exists() and c.is_dir():
@@ -204,12 +215,13 @@ def main() -> None:
 
     py = _resolve_python_interpreter(args.python)
     _assert_python_version(py, 3, 10)
+    proj = _project_root()
 
     total_matches = _expand_total_glob(args.total_glob)
     if not total_matches:
         raise SystemExit(
             f"No files matched --total-glob {args.total_glob!r} "
-            f"(resolved cwd={Path.cwd()})"
+            f"(searched from cwd={Path.cwd()} and project_root={proj})"
         )
 
     out_root = Path(args.out_root)
@@ -224,15 +236,14 @@ def main() -> None:
     if use_resume:
         _save_checkpoint(out_root, ckpt)
 
-    base = [py, "src/train_parquet_surrogate.py", "--total-glob", *total_matches]
+    base = [py, str(proj / "src" / "train_parquet_surrogate.py"), "--total-glob", *total_matches]
     with_detail = args.with_detail or (args.profile == "detail_interactions")
     if with_detail:
         droot = _resolve_detail_root(args.detail_root)
         if droot is None:
             raise SystemExit(
                 f"--detail-root does not exist: {args.detail_root!r} "
-                f"(searched: {(Path.cwd() / args.detail_root).resolve()}, "
-                f"{(Path.cwd().parent / args.detail_root).resolve()})"
+                f"(searched from cwd/project roots)"
             )
         base += ["--detail-root", str(droot)]
     else:
@@ -316,7 +327,7 @@ def main() -> None:
     # Always run summarizer so partial sweeps still produce a report.
     sum_cmd = [
         py,
-        "src/summarize_eda_sweep.py",
+        str(proj / "src" / "summarize_eda_sweep.py"),
         "--sweep-root",
         str(out_root),
         "--baseline-run",
@@ -329,7 +340,7 @@ def main() -> None:
     # Memory estimate helper after sweep.
     est_cmd = [
         py,
-        "src/estimate_training_memory.py",
+        str(proj / "src" / "estimate_training_memory.py"),
         "--total-glob",
         args.total_glob,
     ]
