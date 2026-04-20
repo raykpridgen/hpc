@@ -1,0 +1,11 @@
+# Run outputs (keep directory layout via .gitkeep)
+out/**/*.csv
+out/**/*.ubj
+!out/**/.gitkeep
+data/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+*.egg-info/

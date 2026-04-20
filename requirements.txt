@@ -1,0 +1,9 @@
+# Surrogate training stack (use: conda activate ml_base && pip install -r requirements.txt)
+numpy>=1.24
+pandas>=2.0
+pyarrow>=14.0
+scikit-learn>=1.3
+xgboost>=2.0
+optuna>=3.0
+matplotlib>=3.7
+pytest>=7.0
