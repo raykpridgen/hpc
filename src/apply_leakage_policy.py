@@ -115,8 +115,23 @@ def _time_like_columns(columns: Sequence[str]) -> Set[str]:
     return out
 
 
-def _bytes_like_columns(columns: Sequence[str]) -> Set[str]:
-    return {c for c in columns if "_BYTES_" in c or c.endswith("_BYTES")}
+def _byte_amount_columns(columns: Sequence[str]) -> Set[str]:
+    """Columns that directly encode byte/size magnitudes.
+
+    Keep operation-count style fields (READS/WRITES/etc) available.
+    """
+    out: Set[str] = set()
+    for col in columns:
+        if "_BYTES_" in col or col.endswith("_BYTES"):
+            out.add(col)
+            continue
+        if "_SIZE_" in col:
+            out.add(col)
+            continue
+        if "_MAX_BYTE_" in col:
+            out.add(col)
+            continue
+    return out
 
 
 def _baseline_forbidden(columns: Sequence[str], target_col: str) -> Set[str]:
@@ -142,19 +157,19 @@ def _build_drop_sets(
 ) -> Dict[str, Dict[str, List[str]]]:
     base_forbidden = _baseline_forbidden(columns, target_col)
     time_cols = _time_like_columns(columns)
-    bytes_cols = _bytes_like_columns(columns)
+    byte_amount_cols = _byte_amount_columns(columns)
     read_cols_used = set(feature_meta.get("read_columns_used", []) or [])
     write_cols_used = set(feature_meta.get("write_columns_used", []) or [])
     direct_io_components = {
         c for c in (read_cols_used | write_cols_used) if c in set(columns)
     }
 
-    # Balanced: drop direct components and explicit runtime/target builders,
-    # while keeping other proxy features for exploration.
-    balanced_drop = set(base_forbidden) | direct_io_components
+    # Balanced: drop direct components, explicit runtime/target builders,
+    # and byte/size magnitude columns (but keep op-count fields like READS/WRITES).
+    balanced_drop = set(base_forbidden) | direct_io_components | byte_amount_cols
 
     # Ablation variants extend balanced policy.
-    no_bytes_drop = set(balanced_drop) | bytes_cols
+    no_bytes_drop = set(balanced_drop) | byte_amount_cols
     no_time_drop = set(balanced_drop) | time_cols
 
     def sorted_reasons(drop_set: Set[str]) -> Dict[str, List[str]]:
@@ -165,8 +180,8 @@ def _build_drop_sets(
                 rs.append("direct_target_component")
             if col in direct_io_components:
                 rs.append("direct_io_constructor")
-            if col in bytes_cols:
-                rs.append("byte_family")
+            if col in byte_amount_cols:
+                rs.append("byte_or_size_family")
             if col in time_cols:
                 rs.append("time_family")
             reasons[col] = rs or ["policy_drop"]
