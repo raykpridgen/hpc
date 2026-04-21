@@ -33,6 +33,9 @@ class TrainConfig:
     n_trials: int
     timeout_sec: int
     seed: int
+    early_stopping_rounds: int
+    n_jobs: int
+    sweep_profile: str
     fast_mode: bool
     skip_missing_variants: bool
 
@@ -69,13 +72,13 @@ def _parse_args() -> TrainConfig:
     parser.add_argument(
         "--variants",
         type=str,
-        default="balanced,ablation_no_bytes",
+        default="balanced",
         help="Comma-separated variants to train.",
     )
     parser.add_argument(
         "--target-modes",
         type=str,
-        default="raw,log1p",
+        default="log1p",
         help="Comma-separated target modes: raw,log1p.",
     )
     parser.add_argument(
@@ -93,13 +96,13 @@ def _parse_args() -> TrainConfig:
     parser.add_argument(
         "--n-trials",
         type=int,
-        default=30,
+        default=40,
         help="Optuna trials per dataset/variant/target-mode run.",
     )
     parser.add_argument(
         "--timeout-sec",
         type=int,
-        default=1800,
+        default=2400,
         help="Max optimization walltime per run (seconds).",
     )
     parser.add_argument(
@@ -107,6 +110,28 @@ def _parse_args() -> TrainConfig:
         type=int,
         default=42,
         help="Random seed.",
+    )
+    parser.add_argument(
+        "--early-stopping-rounds",
+        type=int,
+        default=80,
+        help="Patience for early stopping on validation set.",
+    )
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=4,
+        help="XGBoost parallel thread count.",
+    )
+    parser.add_argument(
+        "--sweep-profile",
+        type=str,
+        default="expanded_safe",
+        choices=("baseline", "expanded_safe"),
+        help=(
+            "Hyperparameter search profile. expanded_safe widens space while "
+            "remaining compute-conscious."
+        ),
     )
     parser.add_argument(
         "--fast-mode",
@@ -130,8 +155,14 @@ def _parse_args() -> TrainConfig:
         variants = ("balanced",)
         target_modes = ("log1p",)
         n_trials = min(args.n_trials, 12)
+        timeout_sec = min(args.timeout_sec, 900)
+        early_stopping_rounds = min(args.early_stopping_rounds, 50)
+        sweep_profile = "baseline"
     else:
         n_trials = args.n_trials
+        timeout_sec = args.timeout_sec
+        early_stopping_rounds = args.early_stopping_rounds
+        sweep_profile = args.sweep_profile
 
     for mode in target_modes:
         if mode not in TARGET_MODES:
@@ -140,8 +171,12 @@ def _parse_args() -> TrainConfig:
         raise ValueError("--train-feature-count must be > 0.")
     if n_trials <= 0:
         raise ValueError("--n-trials must be > 0.")
-    if args.timeout_sec <= 0:
+    if timeout_sec <= 0:
         raise ValueError("--timeout-sec must be > 0.")
+    if early_stopping_rounds <= 0:
+        raise ValueError("--early-stopping-rounds must be > 0.")
+    if args.n_jobs <= 0:
+        raise ValueError("--n-jobs must be > 0.")
 
     return TrainConfig(
         input_root=args.input_root,
@@ -152,8 +187,11 @@ def _parse_args() -> TrainConfig:
         target_col=args.target_col,
         train_feature_count=args.train_feature_count,
         n_trials=n_trials,
-        timeout_sec=args.timeout_sec,
+        timeout_sec=timeout_sec,
         seed=args.seed,
+        early_stopping_rounds=early_stopping_rounds,
+        n_jobs=args.n_jobs,
+        sweep_profile=sweep_profile,
         fast_mode=args.fast_mode,
         skip_missing_variants=args.skip_missing_variants,
     )
@@ -219,9 +257,16 @@ def _metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     }
 
 
-def _build_model(params: Dict[str, float | int], seed: int) -> XGBRegressor:
+def _build_model(
+    params: Dict[str, float | int | str],
+    seed: int,
+    n_jobs: int,
+    early_stopping_rounds: int,
+) -> XGBRegressor:
+    tree_method = str(params.get("tree_method", "hist"))
     return XGBRegressor(
         objective="reg:squarederror",
+        tree_method=tree_method,
         n_estimators=int(params["n_estimators"]),
         learning_rate=float(params["learning_rate"]),
         max_depth=int(params["max_depth"]),
@@ -231,22 +276,39 @@ def _build_model(params: Dict[str, float | int], seed: int) -> XGBRegressor:
         reg_alpha=float(params["reg_alpha"]),
         reg_lambda=float(params["reg_lambda"]),
         gamma=float(params["gamma"]),
+        early_stopping_rounds=early_stopping_rounds,
         random_state=seed,
-        n_jobs=4,
+        n_jobs=n_jobs,
     )
 
 
-def _optuna_params(trial: optuna.Trial) -> Dict[str, float | int]:
+def _optuna_params(trial: optuna.Trial, profile: str) -> Dict[str, float | int | str]:
+    if profile == "baseline":
+        return {
+            "tree_method": "hist",
+            "n_estimators": trial.suggest_int("n_estimators", 250, 1400),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.20, log=True),
+            "max_depth": trial.suggest_int("max_depth", 3, 9),
+            "min_child_weight": trial.suggest_float("min_child_weight", 1.0, 20.0),
+            "subsample": trial.suggest_float("subsample", 0.65, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.65, 1.0),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 25.0, log=True),
+            "gamma": trial.suggest_float("gamma", 0.0, 5.0),
+        }
+
+    # Expanded but compute-safe profile.
     return {
-        "n_estimators": trial.suggest_int("n_estimators", 250, 1600),
-        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.25, log=True),
-        "max_depth": trial.suggest_int("max_depth", 3, 10),
-        "min_child_weight": trial.suggest_float("min_child_weight", 1.0, 20.0),
-        "subsample": trial.suggest_float("subsample", 0.6, 1.0),
-        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
-        "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
-        "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 25.0, log=True),
-        "gamma": trial.suggest_float("gamma", 0.0, 5.0),
+        "tree_method": "hist",
+        "n_estimators": trial.suggest_int("n_estimators", 400, 2400),
+        "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.25, log=True),
+        "max_depth": trial.suggest_int("max_depth", 3, 11),
+        "min_child_weight": trial.suggest_float("min_child_weight", 0.5, 30.0),
+        "subsample": trial.suggest_float("subsample", 0.55, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.55, 1.0),
+        "reg_alpha": trial.suggest_float("reg_alpha", 1e-9, 30.0, log=True),
+        "reg_lambda": trial.suggest_float("reg_lambda", 1e-9, 60.0, log=True),
+        "gamma": trial.suggest_float("gamma", 0.0, 10.0),
     }
 
 
@@ -298,8 +360,13 @@ def _fit_one(
     study = optuna.create_study(direction="minimize", sampler=sampler)
 
     def objective(trial: optuna.Trial) -> float:
-        params = _optuna_params(trial)
-        model = _build_model(params, seed=config.seed)
+        params = _optuna_params(trial, config.sweep_profile)
+        model = _build_model(
+            params,
+            seed=config.seed,
+            n_jobs=config.n_jobs,
+            early_stopping_rounds=config.early_stopping_rounds,
+        )
         model.fit(
             x_train,
             y_train_fit,
@@ -312,7 +379,12 @@ def _fit_one(
 
     study.optimize(objective, n_trials=config.n_trials, timeout=config.timeout_sec)
     best = study.best_params
-    final_model = _build_model(best, seed=config.seed)
+    final_model = _build_model(
+        best,
+        seed=config.seed,
+        n_jobs=config.n_jobs,
+        early_stopping_rounds=config.early_stopping_rounds,
+    )
     final_model.fit(
         x_train,
         y_train_fit,
@@ -376,6 +448,9 @@ def _fit_one(
         "n_trials_completed": int(len(study.trials)),
         "timeout_sec": config.timeout_sec,
         "seed": config.seed,
+        "early_stopping_rounds": config.early_stopping_rounds,
+        "n_jobs": config.n_jobs,
+        "sweep_profile": config.sweep_profile,
         "elapsed_sec": elapsed,
         "metrics": metrics,
         "baseline_metrics": baseline_metrics,

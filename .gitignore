@@ -5,6 +5,7 @@ out/**/*.ubj
 data/
 darshan_share/
 out/
+exp/
 spectacular/
 __pycache__/
 *.py[cod]
